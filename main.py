@@ -2,6 +2,7 @@ import os
 import sys
 import signal
 import json
+import argparse
 import numpy as np
 from groq import Groq
 from rank_bm25 import BM25Okapi
@@ -11,33 +12,61 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ─── ARGS ─────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="FileRAG Memory Chatbot")
+parser.add_argument("--user",    type=str, default=None,  help="Your username (e.g. --user jd)")
+parser.add_argument("--model",   type=str, default="llama-3.3-70b-versatile", help="Groq model to use")
+parser.add_argument("--distill", type=int, default=5,     help="Distill every N turns (default: 5)")
+parser.add_argument("--drift",   type=float, default=0.25, help="Topic drift threshold (default: 0.25)")
+args = parser.parse_args()
+
+# ─── USER SETUP ───────────────────────────────────────────
+if args.user:
+    USER_ID = args.user.strip().lower()
+else:
+    USER_ID = input("Enter your username: ").strip().lower()
+    if not USER_ID:
+        print("Username cannot be empty.")
+        sys.exit(1)
+
 # ─── CONFIG ───────────────────────────────────────────────
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "your_groq_key_here")
-GROQ_MODEL         = "llama-3.3-70b-versatile"
-DISTILL_EVERY      = 5           # fallback turn-count trigger
-TOPIC_DRIFT_THRESH = 0.25        # cosine similarity below this = topic drift
+GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
+GROQ_MODEL         = args.model
+DISTILL_EVERY      = args.distill
+TOPIC_DRIFT_THRESH = args.drift
 TOP_K              = 3
 BM25_THRESHOLD     = 0.5
 SEMANTIC_THRESHOLD = 0.25
-USER_ID            = "jd"
-SOUL_FILE          = f"users/{USER_ID}.txt"
-BUFFER_FILE        = f"users/{USER_ID}_buffer.json"
+SOUL_FILE          = os.path.join("users", f"{USER_ID}.txt")
+BUFFER_FILE        = os.path.join("users", f"{USER_ID}_buffer.json")
 os.makedirs("users", exist_ok=True)
 
+# ─── API KEY CHECK ────────────────────────────────────────
+if not GROQ_API_KEY:
+    print("Error: GROQ_API_KEY not found.")
+    print("Add it to your .env file:  GROQ_API_KEY=your_key_here")
+    print("Get your key at: https://console.groq.com")
+    sys.exit(1)
+
 # ─── INIT CLIENTS ─────────────────────────────────────────
+print(f"\nInitializing FileRAG for user: {USER_ID}")
+print("Loading embedding model...")
 groq_client = Groq(api_key=GROQ_API_KEY)
 embedder    = SentenceTransformer("all-MiniLM-L6-v2")
 chroma      = chromadb.PersistentClient(path="./chroma_db")
-collection  = chroma.get_or_create_collection(f"user_{USER_ID}", metadata={"hnsw:space": "cosine"})
-
-print("Clients ready.\n")
+collection  = chroma.get_or_create_collection(
+    f"user_{USER_ID}",
+    metadata={"hnsw:space": "cosine"}
+)
+print("Ready.\n")
 
 # ─── SOUL FILE ────────────────────────────────────────────
 if not os.path.exists(SOUL_FILE):
     with open(SOUL_FILE, "w") as f:
         f.write(f"# Soul File — {USER_ID}\n\n")
+    print(f"Created new soul file: {SOUL_FILE}")
 
-def read_soul():
+def read_soul() -> str:
     with open(SOUL_FILE, "r") as f:
         return f.read()
 
@@ -66,7 +95,7 @@ def embed(texts: list[str]) -> list[list[float]]:
     return embedder.encode(texts, normalize_embeddings=True).tolist()
 
 # ─── DISTILLATION ─────────────────────────────────────────
-def distill(turns: list[dict], reason: str = "scheduled") -> str:
+def distill(turns: list[dict]) -> str:
     if not turns:
         return ""
     formatted = "\n".join([f"{t['role'].upper()}: {t['content']}" for t in turns])
@@ -91,7 +120,8 @@ Conversation:
     res = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=400, temperature=0.2
+        max_tokens=400,
+        temperature=0.2
     )
     return res.choices[0].message.content.strip()
 
@@ -99,26 +129,20 @@ def run_distillation(buf: list, turn_range: str, reason: str = "scheduled"):
     if not buf:
         return
     print(f"\n[Memory] Distilling ({reason})...")
-    summary = distill(buf, reason)
+    summary = distill(buf)
     append_soul(summary, turn_range)
     sync_vector_store()
-    save_buffer([])   # clear persisted buffer
+    save_buffer([])
     print(f"[Memory] Soul file updated ✓")
 
 # ─── TOPIC DRIFT DETECTION ────────────────────────────────
 def detect_topic_drift(buf: list, new_message: str) -> bool:
-    """
-    Compare the semantic meaning of the current buffer
-    vs the new incoming message.
-    If similarity is below threshold → topic has drifted.
-    """
-    if len(buf) < 4:   # need at least 2 turns to compare
+    if len(buf) < 4:
         return False
-    # summarise buffer context into one string
-    buf_text    = " ".join([t["content"] for t in buf[-4:]])
-    vecs        = embed([buf_text, new_message])
-    v1, v2      = np.array(vecs[0]), np.array(vecs[1])
-    similarity  = float(np.dot(v1, v2))   # already normalised
+    buf_text   = " ".join([t["content"] for t in buf[-4:]])
+    vecs       = embed([buf_text, new_message])
+    v1, v2     = np.array(vecs[0]), np.array(vecs[1])
+    similarity = float(np.dot(v1, v2))
     if similarity < TOPIC_DRIFT_THRESH:
         print(f"\n[Memory] Topic drift detected (similarity={similarity:.2f}) — triggering early distillation...")
         return True
@@ -169,11 +193,15 @@ def sync_vector_store():
     ids        = [f"{USER_ID}_chunk_{i}" for i in range(len(chunks))]
     collection.upsert(ids=ids, documents=chunks, embeddings=embeddings)
 
-# ─── GRACEFUL EXIT HANDLER ────────────────────────────────
+# ─── GRACEFUL EXIT ────────────────────────────────────────
 def graceful_exit(sig=None, frame=None):
     print("\n[Memory] Intercepted shutdown — running emergency distillation...")
     if turn_buffer:
-        run_distillation(turn_buffer, f"{total_turns - len(turn_buffer)//2 + 1}-{total_turns}", reason="emergency")
+        run_distillation(
+            turn_buffer,
+            f"{total_turns - len(turn_buffer)//2 + 1}-{total_turns}",
+            reason="emergency"
+        )
     else:
         save_buffer([])
     print("[Memory] Soul file safely committed. Goodbye!")
@@ -183,27 +211,44 @@ signal.signal(signal.SIGINT, graceful_exit)
 signal.signal(signal.SIGTERM, graceful_exit)
 
 # ─── MAIN CHAT LOOP ───────────────────────────────────────
-turn_buffer = load_buffer()   # resume unsaved buffer from last session
+turn_buffer = load_buffer()
 total_turns = 0
 sync_vector_store()
 
 print(f"Chat started | Soul file: {SOUL_FILE}")
-print("Type 'memory' to see soul file | 'quit' to exit\n")
+print("Commands: 'memory' → view soul file | 'clear' → reset memory | 'quit' → exit\n")
 print("-" * 50)
 
 while True:
     user_input = input("\nYou: ").strip()
     if not user_input:
         continue
+
     if user_input.lower() == "quit":
         graceful_exit()
+
     if user_input.lower() == "memory":
         print("\n" + read_soul())
         continue
 
+    if user_input.lower() == "clear":
+        confirm = input("Clear all memory for this user? (yes/no): ").strip().lower()
+        if confirm == "yes":
+            with open(SOUL_FILE, "w") as f:
+                f.write(f"# Soul File — {USER_ID}\n\n")
+            save_buffer([])
+            turn_buffer = []
+            chroma.delete_collection(f"user_{USER_ID}")
+            collection = chroma.get_or_create_collection(
+                f"user_{USER_ID}",
+                metadata={"hnsw:space": "cosine"}
+            )
+            print("[Memory] All memory cleared.")
+        continue
+
     total_turns += 1
 
-    # ── STEP 1: topic drift check → early distillation if needed
+    # STEP 1: topic drift check
     if detect_topic_drift(turn_buffer, user_input):
         run_distillation(
             turn_buffer,
@@ -212,10 +257,10 @@ while True:
         )
         turn_buffer = []
 
-    # ── STEP 2: hybrid retrieve from soul file
+    # STEP 2: hybrid retrieve
     context = hybrid_retrieve(user_input)
 
-    # ── STEP 3: build prompt + get LLM response
+    # STEP 3: build prompt + LLM response
     messages = [{"role": "system", "content": f"""You are a helpful AI assistant talking with {USER_ID}.
 You have a personal memory about this user built over time.
 Rules:
@@ -227,21 +272,27 @@ Rules:
 - Be concise and natural like a friend"""}]
 
     if context:
-        messages.append({"role": "system", "content": f"[What you know about {USER_ID} — only use if relevant]\n{context}"})
+        messages.append({
+            "role": "system",
+            "content": f"[What you know about {USER_ID} — only use if relevant]\n{context}"
+        })
     messages.append({"role": "user", "content": user_input})
 
     response = groq_client.chat.completions.create(
-        model=GROQ_MODEL, messages=messages, max_tokens=1024, temperature=0.7
+        model=GROQ_MODEL,
+        messages=messages,
+        max_tokens=1024,
+        temperature=0.7
     )
     reply = response.choices[0].message.content.strip()
     print(f"\nBot: {reply}")
 
-    # ── STEP 4: append to buffer + persist
+    # STEP 4: append to buffer + persist
     turn_buffer.append({"role": "user",      "content": user_input})
     turn_buffer.append({"role": "assistant", "content": reply})
-    save_buffer(turn_buffer)   # persist after every turn
+    save_buffer(turn_buffer)
 
-    # ── STEP 5: scheduled distillation every N turns
+    # STEP 5: scheduled distillation
     if len(turn_buffer) >= DISTILL_EVERY * 2:
         run_distillation(
             turn_buffer,
