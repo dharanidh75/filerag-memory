@@ -174,4 +174,8 @@ filerag-memory/
 
 ---
 
+<<<<<<< Updated upstream
 *The soul file is 18 KB. Your AI deserves better than a dict.*
+=======
+*The soul file is 18 KB. Your AI deserves better than a dict.*
+>>>>>>> Stashed changes
